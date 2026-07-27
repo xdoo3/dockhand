@@ -7,7 +7,7 @@
 	import CodeEditor, { type VariableMarker } from '$lib/components/CodeEditor.svelte';
 	import StackEnvVarsPanel from '$lib/components/StackEnvVarsPanel.svelte';
 	import { type EnvVar, type ValidationResult } from '$lib/components/StackEnvVarsEditor.svelte';
-	import { Layers, Save, Play, Code, GitGraph, GitBranch, Loader2, AlertCircle, X, Sun, Moon, TriangleAlert, GripVertical, FolderOpen, Copy, Check, XCircle, MapPin, ArrowRight, ArrowDown, Info, Box, FolderSync, Archive } from 'lucide-svelte';
+	import { Layers, Save, Play, Code, GitGraph, GitBranch, Loader2, AlertCircle, X, Sun, Moon, TriangleAlert, GripVertical, FolderOpen, Copy, Check, XCircle, MapPin, ArrowRight, ArrowUp, ArrowDown, Info, Box, FolderSync, Archive } from 'lucide-svelte';
 	import BackupPanel from '../containers/BackupPanel.svelte';
 	import { volumesForStack, type VolumeInfo } from '$lib/utils/mounts';
 	import { fetchBackupExecutions } from '$lib/utils/backup';
@@ -61,6 +61,8 @@
 	let loadError = $state<string | null>(null);
 	let errors = $state<{ stackName?: string; compose?: string }>({});
 	let composeContent = $state('');
+	let composeContents = $state<Record<string, string>>({});   // path → content map for multi-file
+	let activeComposePath = $state('');                           // currently viewed file path
 	let activeTab = $state<'editor' | 'graph' | 'backups'>('editor');
 	let backupCount = $state(0);
 	let backupTally = $state<{ ok: number; failed: number }>({ ok: 0, failed: 0 });
@@ -91,6 +93,12 @@
 	// Working paths: what we're currently editing (always strings, never null)
 	let workingComposePath = $state('');
 	let workingEnvPath = $state('');
+
+	// Multi compose paths (ordered list)
+	let workingComposePaths = $state<string[]>([]);
+
+	// Drag-and-drop state for compose paths reordering
+	let dragIndex = $state<number | null>(null);
 
 	// Original paths: loaded from server (for dirty/change detection in edit mode)
 	let originalComposePath = $state<string | null>(null);
@@ -173,6 +181,8 @@
 		selectFilter?: RegExp;
 		selectMode: 'file' | 'directory' | 'file_or_directory';
 		onSelect: (path: string, name: string) => void;
+		multiSelect?: boolean;
+		onSelectMany?: (entries: { path: string; name: string }[]) => void;
 	}>({
 		title: '',
 		icon: undefined,
@@ -181,17 +191,156 @@
 		onSelect: () => {}
 	});
 
+	function handleComposeMultiSelect(entries: { path: string; name: string }[]) {
+		const newPaths = entries.map(e => e.path);
+		const existing = new Set(workingComposePaths);
+		for (const p of newPaths) {
+			if (!existing.has(p)) {
+				workingComposePaths = [...workingComposePaths, p];
+				existing.add(p);
+			}
+		}
+		// Set the first selected as primary if no primary exists yet
+		if (!workingComposePath && newPaths.length > 0) {
+			workingComposePath = newPaths[0];
+		}
+		// In create mode with browsed files, load content from the first selected file
+		if (mode === 'create' && newPaths.length > 0) {
+			const dir = newPaths[0].replace(/\/[^/]+$/, '');
+			loadFilesFromLocalFilesystem(newPaths[0], `${dir}/.env`);
+			workingEnvPath = `${dir}/.env`;
+			pathSource = 'custom';
+			// Auto-derive stack name from parent directory if user hasn't typed one
+			if (!newStackName.trim()) {
+				const parts = newPaths[0].split('/');
+				if (parts.length >= 2) {
+					const parentDir = parts[parts.length - 2];
+					newStackName = parentDir
+						.toLowerCase()
+						.replace(/[\s_]+/g, '-')
+						.replace(/[^a-z0-9-]/g, '')
+						.replace(/-+/g, '-')
+						.replace(/^-|-$/g, '');
+				}
+			}
+		} else if (mode === 'edit' && newPaths.length > 0) {
+			workingComposePath = newPaths[0];
+			pathSource = 'browsed';
+			const dir = newPaths[0].replace(/\/[^/]+$/, '');
+			if (!workingEnvPath) workingEnvPath = `${dir}/.env`;
+			loadFilesFromLocalFilesystem(newPaths[0], workingEnvPath || suggestedEnvPath || '');
+		}
+		showFileBrowser = false;
+		isDirty = true;
+	}
+
 	function openComposeBrowser() {
-		// For untracked stacks (needsFileLocation), only allow selecting files
-		// For tracked stacks, allow both files and directories
 		const isUntracked = needsFileLocation;
 		fileBrowserConfig = {
 			title: isUntracked ? 'Select compose file' : 'Select compose file or directory',
 			selectFilter: /\.ya?ml$/,
 			selectMode: isUntracked ? 'file' : 'file_or_directory',
-			onSelect: handleComposeSelect
+			onSelect: handleComposeSelect,
+			multiSelect: !isUntracked,
+			onSelectMany: !isUntracked ? handleComposeMultiSelect : undefined
 		};
 		showFileBrowser = true;
+	}
+
+	let browsingRowIndex = $state<number | null>(null);
+
+	function browseForRow(index: number) {
+		browsingRowIndex = index;
+		fileBrowserConfig = {
+			title: 'Select compose file',
+			selectFilter: /\.ya?ml$/,
+			selectMode: 'file',
+			onSelect: (path: string) => {
+				const newPaths = [...workingComposePaths];
+				newPaths[index] = path;
+				workingComposePaths = newPaths;
+				if (index === 0) workingComposePath = path;
+				showFileBrowser = false;
+				browsingRowIndex = null;
+				isDirty = true;
+				// Auto-derive stack name from parent directory when primary file selected
+				if (index === 0 && mode === 'create' && !newStackName.trim()) {
+					const parts = path.split('/');
+					if (parts.length >= 2) {
+						const parentDir = parts[parts.length - 2];
+						newStackName = parentDir
+							.toLowerCase()
+							.replace(/[\s_]+/g, '-')
+							.replace(/[^a-z0-9-]/g, '')
+							.replace(/-+/g, '-')
+							.replace(/^-|-$/g, '');
+					}
+				}
+			},
+		};
+		showFileBrowser = true;
+	}
+
+	function addComposePath() {
+		workingComposePaths = [...workingComposePaths, ''];
+		isDirty = true;
+	}
+
+	function removeComposePath(index: number) {
+		if (workingComposePaths.length <= 1) return;
+		const newPaths = workingComposePaths.filter((_, i) => i !== index);
+		workingComposePaths = newPaths;
+		if (index === 0) {
+			workingComposePath = newPaths[0] || '';
+		}
+		isDirty = true;
+	}
+
+	function movePathUp(index: number) {
+		if (index <= 0) return;
+		const newPaths = [...workingComposePaths];
+		[newPaths[index - 1], newPaths[index]] = [newPaths[index], newPaths[index - 1]];
+		workingComposePaths = newPaths;
+		if (index === 0 || index - 1 === 0) workingComposePath = newPaths[0];
+		isDirty = true;
+	}
+
+	function movePathDown(index: number) {
+		if (index >= workingComposePaths.length - 1) return;
+		const newPaths = [...workingComposePaths];
+		[newPaths[index], newPaths[index + 1]] = [newPaths[index + 1], newPaths[index]];
+		workingComposePaths = newPaths;
+		if (index === 0) workingComposePath = newPaths[0];
+		isDirty = true;
+	}
+
+	function dragStart(e: DragEvent, index: number) {
+		dragIndex = index;
+		if (e.dataTransfer) {
+			e.dataTransfer.effectAllowed = 'move';
+			e.dataTransfer.setData('text/plain', String(index));
+		}
+	}
+
+	function dragOver(e: DragEvent, index: number) {
+		e.preventDefault();
+		if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+		if (dragIndex === null || dragIndex === index) return;
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const before = e.clientY < rect.top + rect.height / 2;
+		const targetIndex = before ? index : index + 1;
+		const newPaths = [...workingComposePaths];
+		const [moved] = newPaths.splice(dragIndex, 1);
+		const insertAt = dragIndex < targetIndex ? targetIndex - 1 : targetIndex;
+		newPaths.splice(insertAt, 0, moved);
+		workingComposePaths = newPaths;
+		dragIndex = insertAt;
+		if (insertAt === 0) workingComposePath = newPaths[0];
+		isDirty = true;
+	}
+
+	function dragEnd() {
+		dragIndex = null;
 	}
 
 	function openEnvBrowser() {
@@ -431,10 +580,26 @@
 				await loadFilesFromLocalFilesystem(finalPath, potentialEnvPath);
 				// Use the selected file's path directly
 				workingComposePath = finalPath;
+				if (!workingComposePaths.includes(finalPath)) {
+					workingComposePaths = [finalPath, ...workingComposePaths];
+				}
 				workingEnvPath = `${dir}/.env`;
 				browsedBaseDirectory = null;
 				// 'custom' prevents the path effect from overriding (it only acts on 'browsed')
 				pathSource = 'custom';
+				// Auto-derive stack name from parent directory if user hasn't typed one
+				if (mode === 'create' && !newStackName.trim()) {
+					const parts = finalPath.split('/');
+					if (parts.length >= 2) {
+						const parentDir = parts[parts.length - 2];
+						newStackName = parentDir
+							.toLowerCase()
+							.replace(/[\s_]+/g, '-')
+							.replace(/[^a-z0-9-]/g, '')
+							.replace(/-+/g, '-')
+							.replace(/^-|-$/g, '');
+					}
+				}
 			} else {
 				pathSource = 'browsed';
 			}
@@ -444,6 +609,9 @@
 
 		// EDIT mode - store the selected path
 		workingComposePath = finalPath;
+		if (!workingComposePaths.includes(finalPath)) {
+			workingComposePaths = [finalPath, ...workingComposePaths];
+		}
 		pathSource = 'browsed';
 		showFileBrowser = false;
 
@@ -524,6 +692,7 @@
 			if (composeResponse.ok) {
 				const composeData = await composeResponse.json();
 				composeContent = composeData.content || '';
+				loadError = null;
 				// Only set workingComposePath in EDIT mode - CREATE mode uses internal defaults
 				if (mode !== 'create') {
 					workingComposePath = composeFilePath;
@@ -640,8 +809,21 @@
 	// Stable callback for compose content changes - avoids stale closure issues
 	function handleComposeChange(value: string) {
 		composeContent = value;
+		if (activeComposePath) {
+			composeContents = { ...composeContents, [activeComposePath]: value };
+		}
 		isDirty = true;
 		debouncedValidate();
+	}
+
+	function switchComposeFile(path: string) {
+		if (path === activeComposePath) return;
+		// Save current content before switching
+		if (activeComposePath) {
+			composeContents = { ...composeContents, [activeComposePath]: composeContent };
+		}
+		activeComposePath = path;
+		composeContent = composeContents[path] || '';
 	}
 
 	// Debounced validation to avoid too many API calls while typing
@@ -756,6 +938,8 @@
 					workingEnvPath = data.envPath || '';
 					// Show empty editors - user can browse for files
 					composeContent = '';
+					composeContents = {};
+					activeComposePath = workingComposePath || '';
 					rawEnvContent = '';
 					loadError = null;
 					loading = false; // Important: stop loading spinner
@@ -802,10 +986,28 @@
 				throw new Error((typeof data.error === 'string' ? data.error : data.message) || 'Failed to load compose file');
 			}
 
-			composeContent = data.content;
+			composeContent = data.content || '';
+			activeComposePath = data.composePath || '';
+			// Populate multi-file content map
+			if (data.composeContents) {
+				composeContents = data.composeContents;
+			} else {
+				composeContents = activeComposePath ? { [activeComposePath]: composeContent } : {};
+			}
 			// Set working paths
 			workingComposePath = data.composePath || '';
 			workingEnvPath = data.envPath || '';
+			// The compose endpoint returns resolved paths as an array; retain support
+			// for the persisted JSON string used by older responses.
+			if (Array.isArray(data.composePaths)) {
+				workingComposePaths = data.composePaths;
+			} else {
+				try {
+					workingComposePaths = data.composePaths ? JSON.parse(data.composePaths) : (workingComposePath ? [workingComposePath] : []);
+				} catch {
+					workingComposePaths = workingComposePath ? [workingComposePath] : [];
+				}
+			}
 			// Track original paths for detecting changes
 			originalComposePath = data.composePath || null;
 			originalEnvPath = data.envPath || null;
@@ -961,10 +1163,29 @@
 			if (workingComposePath.trim()) {
 				requestBody.composePath = workingComposePath.trim();
 			}
+			if (workingComposePaths.length > 0) {
+				requestBody.composePaths = workingComposePaths;
+			}
 			// Use working env path or suggested path
 			const envPathToSave = workingEnvPath.trim() || suggestedEnvPath || '';
 			if (envPathToSave) {
 				requestBody.envPath = envPathToSave;
+			}
+
+			// Include multi-file compose contents if present
+			if (Object.keys(composeContents).length > 0) {
+				// Ensure current editor content is reflected before saving
+				const contentsToSave = { ...composeContents };
+				if (activeComposePath) {
+					contentsToSave[activeComposePath] = composeContent;
+				}
+				requestBody.composeContents = contentsToSave;
+
+				// Prevent data loss: explicitly set primary compose content
+				const primaryPath = workingComposePath || (workingComposePaths && workingComposePaths.length > 0 ? workingComposePaths[0] : activeComposePath);
+				if (primaryPath && contentsToSave[primaryPath]) {
+					requestBody.compose = contentsToSave[primaryPath];
+				}
 			}
 
 			// Create the stack
@@ -1079,6 +1300,9 @@
 			if (workingComposePath.trim()) {
 				requestBody.composePath = workingComposePath.trim();
 			}
+			if (workingComposePaths.length > 0) {
+				requestBody.composePaths = workingComposePaths;
+			}
 
 			// Include env path - empty string means "no env file", null/undefined means "use default"
 			if (envPathToSave) {
@@ -1096,6 +1320,22 @@
 			// Include old directory to move files from if user confirmed
 			if (moveFromDir) {
 				requestBody.moveFromDir = moveFromDir;
+			}
+
+			// Include multi-file compose contents if present
+			if (Object.keys(composeContents).length > 0) {
+				// Ensure current editor content is reflected before saving
+				const contentsToSave = { ...composeContents };
+				if (activeComposePath) {
+					contentsToSave[activeComposePath] = composeContent;
+				}
+				requestBody.composeContents = contentsToSave;
+
+				// Prevent data loss: explicitly set primary compose content
+				const primaryPath = workingComposePath || (workingComposePaths && workingComposePaths.length > 0 ? workingComposePaths[0] : activeComposePath);
+				if (primaryPath && contentsToSave[primaryPath]) {
+					requestBody.content = contentsToSave[primaryPath];
+				}
 			}
 
 			// Save env files BEFORE compose to ensure deploy reads fresh values
@@ -1221,6 +1461,8 @@
 		rawEnvContent = '';
 		errors = {};
 		composeContent = '';
+		composeContents = {};
+		activeComposePath = '';
 		envVars = [];
 		envValidation = null;
 		isDirty = false;
@@ -1535,25 +1777,98 @@
 				<div bind:this={containerRef} class="flex-1 min-h-0 flex flex-col {isDraggingSplit ? 'select-none' : ''}">
 					{#if activeTab === 'editor'}
 						<!-- Path bars row -->
-						<div class="flex items-center border-b border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/30">
-							{#if readonly}
-								<span class="ml-4 flex shrink-0 items-center gap-1 rounded-full border border-purple-500/30 bg-purple-500/10 px-2 py-0.5 text-2xs font-medium text-purple-600 dark:text-purple-400" title="This is a Git-managed stack — Dockhand shows its compose read-only; edit it in the repository.">
-									<GitBranch class="h-3 w-3" /> Git · read-only
-								</span>
-							{/if}
-							<!-- Compose path -->
-							<div class="flex-shrink-0 px-4 py-2" style="width: {splitRatio}%">
-								<PathBarItem
-									label="Compose file"
-									path={workingComposePath || null}
-									placeholder="/path/to/compose.yaml"
-									copied={composePathCopied}
-									onCopy={() => copyText(workingComposePath, (v) => composePathCopied = v)}
-									onBrowse={readonly ? undefined : openComposeBrowser}
-									onChangeLocation={mode === 'edit' && !needsFileLocation && !readonly ? openChangeLocationBrowser : undefined}
-									defaultText={mode === 'create' ? 'Enter stack name above' : 'Not specified'}
-									sourceHint={pathSourceHint}
-								/>
+						<div class="flex min-w-0 overflow-hidden border-b border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/30">
+							<!-- Compose paths -->
+							<div class="flex-shrink-0 min-w-0 max-h-28 overflow-y-auto px-4 py-2" style="width: {splitRatio}%">
+								<div class="flex items-center justify-between mb-1">
+									<div class="flex min-w-0 items-center gap-2">
+										<span class="text-xs font-medium text-muted-foreground whitespace-nowrap">Compose files ({workingComposePaths.length})</span>
+										{#if readonly}
+											<span class="flex shrink-0 items-center gap-1 rounded-full border border-purple-500/30 bg-purple-500/10 px-2 py-0.5 text-2xs font-medium text-purple-600 dark:text-purple-400" title="This is a Git-managed stack — Dockhand shows its compose read-only; edit it in the repository.">
+												<GitBranch class="h-3 w-3" /> Git · read-only
+											</span>
+										{/if}
+									</div>
+									{#if mode === 'edit' && !needsFileLocation && !readonly}
+										<button type="button" class="text-xs text-muted-foreground hover:text-foreground flex items-center gap-1" onclick={openChangeLocationBrowser}>
+											<FolderSync class="w-3 h-3" /> Relocate
+										</button>
+									{/if}
+								</div>
+								{#each workingComposePaths as path, i}
+									{@const total = workingComposePaths.length}
+									{@const isDragging = dragIndex === i}
+									<div
+										class="flex items-center gap-1 mb-1 {isDragging ? 'opacity-40' : ''}"
+										draggable={!readonly && (mode === 'create' || needsFileLocation)}
+										ondragstart={(e) => dragStart(e, i)}
+										ondragover={(e) => dragOver(e, i)}
+										ondrop={(e) => e.preventDefault()}
+										ondragend={dragEnd}
+									>
+										{#if total > 1 && !readonly && (mode === 'create' || needsFileLocation)}
+											<div class="flex flex-col shrink-0 -space-y-0.5">
+												<button type="button" title="Move up" disabled={i === 0}
+													onclick={() => movePathUp(i)} class="p-0 hover:text-muted-foreground disabled:opacity-30 disabled:cursor-default">
+													<ArrowUp class="w-3 h-3" />
+												</button>
+												<button type="button" title="Move down" disabled={i === total - 1}
+													onclick={() => movePathDown(i)} class="p-0 hover:text-muted-foreground disabled:opacity-30 disabled:cursor-default">
+													<ArrowDown class="w-3 h-3" />
+												</button>
+											</div>
+											<GripVertical class="w-3.5 h-3.5 text-muted-foreground/40 shrink-0 cursor-grab" />
+											<span class="text-2xs text-muted-foreground shrink-0 w-4 text-center">{i + 1}</span>
+										{/if}
+										<input
+											type="text"
+											bind:value={workingComposePaths[i]}
+											readonly={readonly || (mode === 'edit' && !needsFileLocation)}
+											placeholder={i === 0 ? '/path/to/compose.yaml' : 'compose.override.yaml'}
+											class="flex-1 px-2 py-1 text-xs border rounded bg-background min-w-0 {readonly || (mode === 'edit' && !needsFileLocation) ? 'text-muted-foreground' : ''}"
+											oninput={() => { if (i === 0) { workingComposePath = workingComposePaths[i]; } isDirty = true; }}
+										/>
+										{#if !readonly && (mode === 'create' || needsFileLocation)}
+											<button type="button" onclick={() => browseForRow(i)}
+												class="p-1 rounded hover:bg-muted text-muted-foreground shrink-0" title="Browse for file">
+												<FolderOpen class="w-3.5 h-3.5" />
+											</button>
+										{/if}
+										{#if total > 1 && !readonly && (mode === 'create' || needsFileLocation)}
+											<button type="button" onclick={() => removeComposePath(i)}
+												class="p-1 rounded hover:bg-red-100 dark:hover:bg-red-900/30 text-muted-foreground hover:text-red-500 shrink-0" title="Remove">
+												<X class="w-3.5 h-3.5" />
+											</button>
+										{/if}
+									</div>
+								{/each}
+								{#if workingComposePaths.length === 0}
+									<div class="flex items-center gap-1 mb-1">
+										<input type="text" readonly
+											placeholder={mode === 'create' ? 'Enter stack name above' : 'Not specified'}
+											class="flex-1 px-2 py-1 text-xs border rounded bg-muted/50 min-w-0 text-muted-foreground"
+										/>
+										{#if !readonly && (mode === 'create' || needsFileLocation)}
+											<button type="button" onclick={openComposeBrowser}
+												class="p-1 rounded hover:bg-muted text-muted-foreground shrink-0" title="Browse for file">
+												<FolderOpen class="w-3.5 h-3.5" />
+											</button>
+										{/if}
+									</div>
+									{#if !readonly && (mode === 'create' || needsFileLocation)}
+										<button type="button" onclick={() => { addComposePath(); }}
+											class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-muted text-muted-foreground border hover:bg-muted/80">
+											+ Add compose file
+										</button>
+									{/if}
+								{:else}
+									{#if !readonly && (mode === 'create' || needsFileLocation)}
+										<button type="button" onclick={() => { addComposePath(); }}
+											class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-muted text-muted-foreground border hover:bg-muted/80">
+											+ Add compose file
+										</button>
+									{/if}
+								{/if}
 							</div>
 							<!-- Divider spacer -->
 							<div class="w-1 flex-shrink-0"></div>
@@ -1598,7 +1913,13 @@
 							<div class="flex-shrink-0 flex flex-col min-w-0" style="width: {splitRatio}%">
 								{#if open}
 									<div class="flex-1 p-3 min-h-0">
-										{#if readonly && needsFileLocation && !composeContent}
+										{#if loadError}
+											<div class="h-full rounded-md border border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-900/20 flex flex-col items-center justify-center text-center px-8">
+												<TriangleAlert class="w-12 h-12 text-red-400 mb-4" />
+												<h3 class="text-sm font-medium text-red-700 dark:text-red-300 mb-2">Failed to load compose file</h3>
+												<p class="text-xs text-red-600 dark:text-red-400 max-w-sm break-all">{loadError}</p>
+											</div>
+										{:else if readonly && needsFileLocation && !composeContent}
 											<div class="h-full rounded-md border border-dashed border-zinc-300 dark:border-zinc-600 bg-zinc-50 dark:bg-zinc-800/30 flex flex-col items-center justify-center text-center px-8">
 												<GitGraph class="w-12 h-12 text-zinc-300 dark:text-zinc-600 mb-4" />
 												<h3 class="text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-2">Compose file not available</h3>
@@ -1652,6 +1973,20 @@
 														{/if}
 													</Button>
 												</div>
+												<!-- Compose file tabs when multiple files are present -->
+												{#if workingComposePaths.length > 1}
+													<div class="flex items-center gap-1 mb-1 overflow-x-auto">
+														{#each workingComposePaths as path, i}
+															<button
+																type="button"
+																onclick={() => switchComposeFile(path)}
+																class="shrink-0 px-2 py-0.5 text-xs rounded border whitespace-nowrap {path === activeComposePath ? 'bg-blue-100 dark:bg-blue-900/30 border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 font-medium' : 'bg-muted border-zinc-300 dark:border-zinc-600 text-muted-foreground hover:bg-muted/80'}"
+															>
+																{path.split('/').pop() || path}
+															</button>
+														{/each}
+													</div>
+												{/if}
 												<CodeEditor
 													bind:this={codeEditorRef}
 													value={composeContent}
@@ -1962,5 +2297,7 @@
 	selectFilter={fileBrowserConfig.selectFilter}
 	selectMode={fileBrowserConfig.selectMode}
 	onSelect={fileBrowserConfig.onSelect}
+	multiSelect={fileBrowserConfig.multiSelect ?? false}
+	onSelectMany={fileBrowserConfig.onSelectMany}
 	onClose={() => showFileBrowser = false}
 />
